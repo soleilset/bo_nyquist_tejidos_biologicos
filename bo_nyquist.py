@@ -137,7 +137,6 @@ def generate_warmup(n_inclusiones, omega, sigma_ref, n_warmup=10, seed=42):
     return thetas_warmup, L_values
 
 
-
 # Parámetros de entrada (ejemplo para testeo inicial)
 n_inclusiones = 1
 omega = np.logspace(-2, 6, 100) * 2 * np.pi  # frecuencias en rad/s
@@ -149,13 +148,38 @@ theta_true = [
 ]
 sigma_ref = compute_sigma_e(theta_true, omega)
 
-X_warm, Y_warm = generate_warmup(n_inclusiones, omega, sigma_ref)
-# --- Escalonamiento e inversión ---
+# --- Entrenamiento del GP ---
+thetas_warm, L_warm = generate_warmup(n_inclusiones, omega, sigma_ref)
+thetas_scaled, thetas_scaler_info = preprocess_theta(thetas_warm)
+L_scaled, L_scaled_info = preprocess_L(L_warm)
 
-X_scaled, scaler_info = preprocess_theta(X_warm)
-X_recovered = inverse_preprocess_theta(X_scaled, scaler_info)
+# Entrenar surrogate GP
+gp = GaussianProcessRegressor(
+    kernel=Matern(length_scale=np.ones(thetas_scaled.shape[1]), nu=2.5) + WhiteKernel(noise_level=1e-8, noise_level_bounds='fixed'),
+    alpha=0.0,
+    normalize_y=False
+)
+gp.fit(thetas_scaled, L_scaled)
 
-print (X_warm[1])
-print (X_scaled)
-print (X_recovered)
+# Verificar GP en warm-up
+L_mean_scaled, L_std_scaled = gp.predict(thetas_scaled, return_std=True)
+L_mean = inverse_preprocess_L(L_mean_scaled, L_scaled_info)
+L_std = inverse_preprocess_L(L_std_scaled, L_scaled_info)
+r2 = 1 - np.sum((L_warm - L_mean)**2) / np.sum((L_warm - np.mean(L_warm))**2)
+print("GP entrenado con kernel:", gp.kernel_)
+print(f"R^2 en warm-up: {r2:.3f}")
 
+# --- Error de predicción vs incertidumbre ---
+errors = L_mean - L_warm
+# Mostrar comparación error vs std
+df_err = pd.DataFrame({
+    'L_real': L_warm,
+    'L_pred': L_mean,
+    'Error': errors,
+    'Std_pred': L_std
+})
+print("Error vs Incertidumbre en warm-up:")
+print(df_err)
+# Estadísticas de cobertura (|error| < 2*std)
+coverage = np.mean(np.abs(errors) < 2*L_std)
+print(f"Fracción de puntos con |error| < 2\sigma: {coverage:.2%}")
