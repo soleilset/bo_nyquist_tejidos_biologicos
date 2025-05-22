@@ -136,6 +136,39 @@ def generate_warmup(n_inclusiones, omega, sigma_ref, n_warmup=10, seed=42):
         L_values.append(L_theta(theta_rand, omega, sigma_ref))
     return thetas_warmup, L_values
 
+def get_normalized_bounds(scaler_info):
+    """
+    Devuelve un array (2, D) con los límites normalizados para cada parámetro
+    usando exclusivamente la información de 'scaler_info' (mu y sigma) de los datos del warmup.
+    Ranges óptimos están definidos internamente.
+
+    - scaler_info: lista de tuplas (scale_type, mu, sigma) de longitud D.
+    - Retorna matriz shape (2, D): fila 0 = límites mínimos escalados, fila 1 = límites máximos escalados.
+    """
+    # Rangos óptimos para cada parámetro en escala real
+    optimal_ranges = [
+        (0.01, 0.3),    # f_l
+        (1e-6, 1e-2),   # tau_l
+        (0.5, 1.0),     # c_l
+        (1.0, 100.0),   # rho_l
+        (0.1, 10.0)     # rho_0
+    ]
+    D = len(scaler_info)
+    # Calcular límites normalizados analíticamente
+    bounds = np.zeros((2, D), dtype=float)
+    for j, ((scale_type, mu, sigma)) in enumerate(scaler_info):
+        min_val, max_val = optimal_ranges[j]
+        if scale_type == 'standard':
+            lo = (min_val - mu) / sigma
+            hi = (max_val - mu) / sigma
+        else:  # log_standard
+            log_min = np.log10(min_val)
+            log_max = np.log10(max_val)
+            lo = (log_min - mu) / sigma
+            hi = (log_max - mu) / sigma
+        bounds[0, j] = lo
+        bounds[1, j] = hi
+    return bounds
 
 # Parámetros de entrada (ejemplo para testeo inicial)
 n_inclusiones = 1
@@ -161,25 +194,5 @@ gp = GaussianProcessRegressor(
 )
 gp.fit(thetas_scaled, L_scaled)
 
-# Verificar GP en warm-up
-L_mean_scaled, L_std_scaled = gp.predict(thetas_scaled, return_std=True)
-L_mean = inverse_preprocess_L(L_mean_scaled, L_scaled_info)
-L_std = inverse_preprocess_L(L_std_scaled, L_scaled_info)
-r2 = 1 - np.sum((L_warm - L_mean)**2) / np.sum((L_warm - np.mean(L_warm))**2)
-print("GP entrenado con kernel:", gp.kernel_)
-print(f"R^2 en warm-up: {r2:.3f}")
-
-# --- Error de predicción vs incertidumbre ---
-errors = L_mean - L_warm
-# Mostrar comparación error vs std
-df_err = pd.DataFrame({
-    'L_real': L_warm,
-    'L_pred': L_mean,
-    'Error': errors,
-    'Std_pred': L_std
-})
-print("Error vs Incertidumbre en warm-up:")
-print(df_err)
-# Estadísticas de cobertura (|error| < 2*std)
-coverage = np.mean(np.abs(errors) < 2*L_std)
-print(f"Fracción de puntos con |error| < 2\sigma: {coverage:.2%}")
+print(thetas_scaled[4])
+print(get_normalized_bounds(thetas_scaler_info))
