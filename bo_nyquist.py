@@ -4,7 +4,6 @@ from scipy.stats import norm
 from scipy.optimize import minimize
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, WhiteKernel
-import pandas as pd
 
 
 # --- Supuestos iniciales ---
@@ -176,7 +175,7 @@ def hybrid_acquisition(thetas_scaled, L_best_scaled, gp, t, alpha, kappa):
     """
     Combina UCB y EI con peso exponencial w=exp(-t/(alpha*D)).
     """
-    thetas_scaled = np.array(thetas_scaled)
+    thetas_scaled = np.array(thetas_scaled, dtype=float)
     mu_a, sigma_a = gp.predict(thetas_scaled.reshape(1, -1), return_std=True)
     mu = mu_a.item()
     sigma = sigma_a.item()
@@ -207,21 +206,117 @@ def propose_next_theta(L_scaled, bounds, gp, t, alpha, kappa, n_restarts):
                 best_val, best_theta = val, res.x
     return best_theta, best_val
 
-omega = np.logspace(1, 6, 100) * 2 * np.pi 
-theta_test = [0.1, 1e-4, 0.8, 10.0,0.05, 1e-3, 0.7, 100.0, 1.0]
-sigma_ref = compute_sigma_e(theta_test, omega)
+# --- Proceso iterativo de Optimización Bayesiana ---
 
-thetas, Ls = generate_warmup(omega, sigma_ref, n_inclusiones=2, n_warmup=2)
-theta_scaled, scaler_info = preprocess_theta(thetas)
-L_scaled, L_info = preprocess_L(Ls)
-gp = GaussianProcessRegressor(
-    kernel=Matern(length_scale=np.ones(theta_scaled.shape[1]), nu=2.5) + 
-           WhiteKernel(noise_level=1e-8, noise_level_bounds='fixed'),
-    alpha=0.0,
-    normalize_y=False
-)
-gp.fit(theta_scaled, L_scaled)
-bounds = get_normalized_bounds(scaler_info)
-x_next, best_val = propose_next_theta(Ls, bounds, gp, 4, 5, 2,10)
-theta_next = inverse_preprocess_theta(x_next, scaler_info)
-print("Theta propuesto:", theta_next)
+def bayes_optimize(omega, sigma_ref, n_inclusiones,
+                   warmup_n=10, max_iter=50, max_no_improve=10,
+                   epsilon=1e-8, tol=1e-6,
+                   alpha=5.0, kappa=2.0, n_restarts=10):
+    # Warm-up y límites
+    thetas, Ls = generate_warmup(omega, sigma_ref, n_inclusiones, warmup_n)
+    theta_scaled, scaler_info = preprocess_theta(thetas)
+    bounds = get_normalized_bounds(scaler_info)
+
+    # Inicialización
+    idx0 = np.argmin(Ls)
+    theta_best, L_best = thetas[idx0], Ls[idx0]
+    no_improve = 0
+    history_L = [L_best]
+
+    # Bucle principal
+    for t in range(1, max_iter+1):
+        # Ajuste GP
+        Xs,Xs_scaler_info = preprocess_theta(thetas)
+        Ys, _ = preprocess_L(Ls)
+        D = Xs.shape[1]
+        kernel = Matern(length_scale=np.ones(D), length_scale_bounds=(1e-2,1e2), nu=2.5) + WhiteKernel(noise_level=1e-8, noise_level_bounds='fixed')
+        gp = GaussianProcessRegressor(kernel=kernel, alpha=0.0, normalize_y=False)
+        gp.fit(Xs, Ys)
+
+        print(f"[iter {t:02d}] Kernel: {gp.kernel_}")
+        print(f"[iter {t:02d}] Length-scales: {gp.kernel_.k1.length_scale}")
+
+        # Propuesta y diagnóstico
+        theta_next_scaled, acq_val = propose_next_theta(Ys, bounds, gp, t, alpha, kappa, n_restarts)
+        w = np.exp(-t/(alpha*D))
+        mu_pred, sigma_pred = gp.predict(theta_next_scaled.reshape(1,-1), return_std=True)
+        mu_pred, sigma_pred = mu_pred.item(), sigma_pred.item()
+
+        print(f"[iter {t:02d}] w(t)={w:.3f}, acq={acq_val:.3e}, mu={mu_pred:.3e}, sigma={sigma_pred:.3e}")
+
+        # Inversión y evaluación
+        theta_next = inverse_preprocess_theta(theta_next_scaled, Xs_scaler_info)
+        L_next = L_theta(theta_next, omega, sigma_ref)
+        print(f"[iter {t:02d}] L(theta_next)={L_next:.3e}")
+
+        # Actualizar
+        thetas = np.vstack([thetas, theta_next])
+        Ls = np.append(Ls, L_next)
+        history_L.append(min(L_best, L_next))
+
+        # Mejora
+        if L_next < L_best - epsilon:
+            theta_best, L_best = theta_next, L_next
+            no_improve = 0
+        else:
+            no_improve += 1
+
+        if L_best < tol:
+            print("Convergencia alcanzada: L_best < tol")
+            break
+        if no_improve >= max_no_improve:
+            print("Detenido por falta de mejora")
+            break
+
+    # Visualizaciones finales
+    plt.figure(figsize=(6,4))
+    plt.plot(history_L, '-o')
+    plt.xlabel('Iteración')
+    plt.ylabel('Mejor L')
+    plt.title('Evolución de la función objetivo')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    sigma_best = compute_sigma_e(theta_best, omega)
+    plt.figure(figsize=(6,6))
+    plt.plot(np.real(sigma_ref), -np.imag(sigma_ref), 'o', label='Referencia')
+    plt.plot(np.real(sigma_best), -np.imag(sigma_best), '-', label='Modelo óptimo')
+    plt.xlabel('Re(σ)')
+    plt.ylabel('-Im(σ)')
+    plt.title('Diagrama de Nyquist final')
+    plt.legend()
+    plt.grid(True)
+    plt.axis('equal')
+    plt.tight_layout()
+    plt.show()
+
+    return theta_best, L_best, thetas, Ls
+
+# Ejecución de ejemplo con 1 inclusión
+if __name__ == "__main__":
+    # Definimos frecuencias omega
+    omega = np.logspace(1, 6, 100) * 2 * np.pi
+    # Parámetros reales para generar datos sintéticos (1 inclusión):
+    # f1, tau1, c1, rho1, rho0
+    theta_true = [0.1, 1e-4, 0.8, 10.0, 1.0]
+    sigma_ref = compute_sigma_e(theta_true, omega)
+
+    # Ejecutamos la optimización Bayesiana
+    theta_opt, L_opt, thetas_hist, Ls_hist = bayes_optimize(
+        omega, sigma_ref,
+        n_inclusiones=1,
+        warmup_n=10,
+        max_iter=30,
+        max_no_improve=10,
+        epsilon=1e-8,
+        tol=1e-3,
+        alpha=5.0,
+        kappa=2.0,
+        n_restarts=10
+    )
+
+    # Resultados
+    print("Theta óptimo (1 inclusión):", theta_opt)
+    print("Valor de L óptimo:", L_opt)
+    # La función ya genera las gráficas de evolución y Nyquist
