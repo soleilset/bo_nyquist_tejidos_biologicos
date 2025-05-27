@@ -170,26 +170,59 @@ def get_normalized_bounds(scaler_info):
         bounds[1, j] = hi
     return bounds
 
-# --- Adquisición híbrida UCB/EI ---
-def hybrid_acquisition(thetas_scaled, L_best_scaled, gp, t, alpha, kappa):
+def acquisition_fun(thetas_scaled, L_best_scaled, gp, t, alpha, kappa, mode):
     """
-    Combina UCB y EI con peso exponencial w=exp(-t/(alpha*D)).
+    Función de adquisición configurable.
+    
+    Parámetros:
+    -----------
+    thetas_scaled : array-like, shape (D,)
+        Punto candidato en escala normalizada.
+    L_best_scaled : float
+        Mejor valor de la función objetivo (ya escalado).
+    gp : GaussianProcessRegressor
+        Modelo GP entrenado.
+    t : int
+        Iteración actual (para el decaimiento en híbrido).
+    alpha : float
+        Parámetro de decaimiento para la mezcla híbrida.
+    kappa : float
+        Parámetro de exploración para UCB/LCB.
+    mode : str, opcional {'ei', 'lcb', 'ucb', 'hybrid'}
+        Modo de adquisición:
+          - 'ei'     : Expected Improvement        
+          - 'lcb'    : Lower Confidence Bound (minimizar)
+          - 'hybrid' : Mezcla w·LCB + (1–w)·EI, con w=exp(–t/(α·D))
+    
+    Retorna:
+    --------
+    float
+        Valor de la función de adquisición en thetas_scaled.
     """
+
     thetas_scaled = np.array(thetas_scaled, dtype=float)
     mu_a, sigma_a = gp.predict(thetas_scaled.reshape(1, -1), return_std=True)
     mu = mu_a.item()
     sigma = sigma_a.item()
+    
     # EI
-    z = (L_best_scaled - mu) / sigma
+    z = (L_best_scaled - mu) / (sigma + 1e-12)  # Evitar división por cero
     EI = (L_best_scaled - mu) * norm.cdf(z) + sigma * norm.pdf(z)
-    # UCB
-    UCB = mu - kappa * sigma
-    # peso de exploración
-    D = thetas_scaled.size  # número de dimensiones
-    w = np.exp(-t / (alpha * D))    
-    return w * UCB + (1 - w) * EI
+    # LCB
+    LCB = mu - kappa * sigma  
 
-def propose_next_theta(L_scaled, bounds, gp, t, alpha, kappa, n_restarts):
+    if mode == 'ei':
+        return float(EI)
+    elif mode == 'lcb':
+        return float(LCB)
+    elif mode == 'hybrid':
+        D = thetas_scaled.size  # número de dimensiones
+        w = np.exp(-t / (alpha * D)) # peso de exploración
+        return float(w * LCB + (1 - w) * EI)
+    else:
+        raise ValueError(f"Modo desconocido '{mode}'. Elija 'ei', 'lcb', 'ucb' o 'hybrid'.")
+
+def propose_next_theta(L_scaled, bounds, gp, t, alpha, kappa, n_restarts, mode):
     """
     Propone el siguiente theta en escala normalizada usando multistart L-BFGS-B.
     """
@@ -198,7 +231,7 @@ def propose_next_theta(L_scaled, bounds, gp, t, alpha, kappa, n_restarts):
     best_theta, best_val = None, -np.inf
     for i in range(n_restarts):
         theta0 = np.array([np.random.uniform(lo, hi) for lo, hi in bounds])
-        res = minimize(lambda x: -hybrid_acquisition(x, L_best, gp, t, alpha, kappa),
+        res = minimize(lambda x: -acquisition_fun(x, L_best, gp, t, alpha, kappa, mode),
                        theta0, method='L-BFGS-B', bounds=bounds)
         if res.success:
             val = res.fun
@@ -206,9 +239,104 @@ def propose_next_theta(L_scaled, bounds, gp, t, alpha, kappa, n_restarts):
                 best_val, best_theta = val, res.x
     return best_theta, best_val
 
+# escala un único theta (1D) usando scaler_info en nuestro espacio normalizado
+def scale_single_theta(theta, scaler_info):
+    """
+    Escala un único theta (1D) usando scaler_info sin volver a estimar medias/desv.
+    """
+    arr = np.array(theta, dtype=float)
+    D = len(arr)
+    x_scaled = np.zeros(D, dtype=float)
+    for j, (stype, mu, sigma) in enumerate(scaler_info):
+        if sigma == 0:
+            sigma = 1.0
+        if stype == 'standard':
+            x_scaled[j] = (arr[j] - mu) / sigma
+        else:  # log_standard
+            x_scaled[j] = (np.log10(arr[j]) - mu) / sigma
+    return x_scaled
+
+
+# --- Diagnóstico del GP ---
+def diagnose_gp(omega, thetas, Ls, scaler_info, gp):
+    """
+    Etapa 1: diagnóstico del GP
+    Subtareas:
+      1. Comparar μ(θ_i) vs. L(θ_i) en puntos nuevos
+      2. Visualizar μ y σ sobre el plano (f1, τ1)
+      3. Imprimir length_scales por dimensión
+    """
+    # 1) Comparación μ vs L en puntos nuevos
+    # ------------------------------------------------
+    # Genero 100 muestras aleatorias en rango físico
+    D = scaler_info.__len__()  # dimensiones totales
+    # reconstruyo rangos reales a partir de scaler_info
+    bounds_real = []
+    base = [(0.01,0.3),(1e-6,1e-2),(0.5,1.0),(1.0,100.0)]
+    rho0_range = (0.1,10.0)
+    for j, (_, mu, sigma) in enumerate(scaler_info):
+        if j == D-1: bounds_real.append(rho0_range)
+        else:        bounds_real.append(base[j%4])
+    # muestreo
+    thetas_test = np.array([[np.random.uniform(lo,hi) for lo,hi in bounds_real] for _ in range(100)])
+    Ls_test = np.array([L_theta(theta, omega, sigma_ref) for theta in thetas_test])
+    # predicción GP
+    Xs_test, _ = preprocess_theta(thetas_test)
+    mu_pred, _ = gp.predict(Xs_test, return_std=True)
+    # L real
+    L_true, _ = preprocess_L(Ls_test)
+    # gráfico μ vs L
+    plt.figure()
+    plt.scatter(L_true, mu_pred, alpha=0.6)
+    plt.plot([L_true.min(), L_true.max()],[L_true.min(), L_true.max()], 'k--')
+    plt.xlabel('L_true')
+    plt.ylabel('μ_GP')
+    plt.title('Diagnóstico GP: μ vs L')
+    plt.show()
+
+    # 2) Mapas de μ y σ para cada par (i,j)
+    theta_fix = thetas[-1].copy()
+    grid_n = 40
+    for i in range(2):
+        for j in range(i+1, 3):
+            # generar malla
+            xi = np.linspace(*bounds_real[i], grid_n)
+            xj = np.linspace(*bounds_real[j], grid_n)
+            MU = np.zeros((grid_n, grid_n))
+            SIG = np.zeros((grid_n, grid_n))
+            for ii, vi in enumerate(xi):
+                for jj, vj in enumerate(xj):
+                    θ = theta_fix.copy()
+                    θ[i], θ[j] = vi, vj
+                    Xs = scale_single_theta(θ, scaler_info)
+                    mu2, sigma2 = gp.predict(Xs.reshape(1, -1) , return_std=True)
+                    MU[ii,jj] = mu2
+                    SIG[ii,jj] = sigma2
+
+            # plot μ
+            plt.figure(figsize=(4,3))
+            plt.contourf(xj, xi, MU, levels=20)
+            plt.xlabel(f'θ[{j}]'); plt.ylabel(f'θ[{i}]')
+            plt.title(f'μ_GP en (θ[{i}],θ[{j}])')
+            plt.colorbar()
+            plt.tight_layout()
+            plt.show()
+
+            # plot σ
+            plt.figure(figsize=(4,3))
+            plt.contourf(xj, xi, SIG, levels=20)
+            plt.xlabel(f'θ[{j}]'); plt.ylabel(f'θ[{i}]')
+            plt.title(f'σ_GP en (θ[{i}],θ[{j}])')
+            plt.colorbar()
+            plt.tight_layout()
+            plt.show()
+
+    # 3) Imprimir length_scales
+    print("Length-scales del GP:", gp.kernel_.k1.length_scale)
+
 # --- Proceso iterativo de Optimización Bayesiana ---
 
-def bayes_optimize(omega, sigma_ref, n_inclusiones,
+def bayes_optimize(omega, sigma_ref, n_inclusiones, mode,
                    warmup_n=10, max_iter=50, max_no_improve=10,
                    epsilon=1e-8, tol=1e-6,
                    alpha=5.0, kappa=2.0, n_restarts=10):
@@ -229,15 +357,23 @@ def bayes_optimize(omega, sigma_ref, n_inclusiones,
         Xs,Xs_scaler_info = preprocess_theta(thetas)
         Ys, _ = preprocess_L(Ls)
         D = Xs.shape[1]
-        kernel = Matern(length_scale=np.ones(D), length_scale_bounds=(1e-2,1e2), nu=2.5) + WhiteKernel(noise_level=1e-8, noise_level_bounds='fixed')
+        """
+        # Filtrar NaNs antes de entrenar
+        if np.isnan(Xs).any() or np.isnan(Ys).any():
+            mask = (~np.isnan(Ys)) & (~np.isnan(Xs).any(axis=1))
+            Xs, Ys = Xs[mask], Ys[mask]
+            thetas = thetas[mask]
+            Ls = Ls[mask]
+            Xs, Xs_scaler_info = preprocess_theta(thetas)
+            Ys, _ = preprocess_L(Ls)"""
+
+        kernel = Matern(length_scale=np.ones(D), length_scale_bounds=(1e-2, 1e5), nu=2.5) + WhiteKernel(noise_level=1e-8, noise_level_bounds='fixed')
         gp = GaussianProcessRegressor(kernel=kernel, alpha=0.0, normalize_y=False)
         gp.fit(Xs, Ys)
-
-        print(f"[iter {t:02d}] Kernel: {gp.kernel_}")
-        print(f"[iter {t:02d}] Length-scales: {gp.kernel_.k1.length_scale}")
+        diagnose_gp(omega, thetas, Ls, scaler_info, gp)
 
         # Propuesta y diagnóstico
-        theta_next_scaled, acq_val = propose_next_theta(Ys, bounds, gp, t, alpha, kappa, n_restarts)
+        theta_next_scaled, acq_val = propose_next_theta(Ys, bounds, gp, t, alpha, kappa, n_restarts, mode)
         w = np.exp(-t/(alpha*D))
         mu_pred, sigma_pred = gp.predict(theta_next_scaled.reshape(1,-1), return_std=True)
         mu_pred, sigma_pred = mu_pred.item(), sigma_pred.item()
@@ -305,15 +441,16 @@ if __name__ == "__main__":
     # Ejecutamos la optimización Bayesiana
     theta_opt, L_opt, thetas_hist, Ls_hist = bayes_optimize(
         omega, sigma_ref,
-        n_inclusiones=1,
-        warmup_n=10,
+        n_inclusiones=1, 
+        mode = 'ei',
+        warmup_n=20,
         max_iter=30,
         max_no_improve=10,
         epsilon=1e-8,
         tol=1e-3,
-        alpha=5.0,
-        kappa=2.0,
-        n_restarts=10
+        alpha=1/20,
+        kappa=3.0,
+        n_restarts=30
     )
 
     # Resultados
